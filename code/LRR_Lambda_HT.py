@@ -1,7 +1,4 @@
-#!/usr/bin/env python
-# coding: utf-8
 
-# In[1]:
 
 
 import os
@@ -16,11 +13,6 @@ import pandas as pd
 import bottleneck as bn
 import matplotlib.pyplot as plt
 
-import tensorflow as tf
-from tensorflow.contrib.layers import apply_regularization, l2_regularizer
-
-
-# In[2]:
 
 
 import torch
@@ -28,14 +20,115 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
+class DataReader(object):
+    
+    def __init__(self, train_df, num_item):
+        
+        self.train_df = train_df
+        self.train_u_dict = train_df.groupby('user')['item'].apply(list).to_dict()
+        self.trainUser = train_df['user'].values
+        self.trainItem = train_df['item'].values
+        self.num_item = num_item
+    
+    def bpr_getTrain(self, train_batch_size, N = 2):
 
-# In[3]:
+        train_u = []
+        train_pos_i = []
+        train_neg_i = []
+
+        u_list = self.trainUser
+        i_list = self.trainItem
+
+        for index in range(len(u_list)):
+
+            u = u_list[index]
+            i = i_list[index]
+            train_u.extend([u]*(N))
+            train_pos_i.extend([i]*(N))
+
+            PositiveSet = set(self.train_u_dict[u]) 
+
+            for t in range(N):# sample negative items
+                neg_i = np.random.randint(0, self.num_item)
+                while neg_i in PositiveSet:
+                    neg_i = np.random.randint(0, self.num_item)
+                train_neg_i.append(neg_i)
+
+        train_dataset = BPRDataset(train_u, train_pos_i, train_neg_i)
+
+        train_dataloader = DataLoader(train_dataset,
+                                      batch_size = train_batch_size, 
+                                      shuffle = True,
+                                      num_workers = 4,
+                                      pin_memory = True,
+                                     )
+
+        return train_dataloader
+    
+class BPRDataset(Dataset):
+
+    def __init__(self, users, pos_items, neg_items):
+
+        self.users = users
+        self.pos_items = pos_items
+        self.neg_items = neg_items
+
+    def __len__(self):
+
+        return len(self.users)
+
+    def __getitem__(self, idx):
+
+        user = self.users[idx]
+        pos_item = self.pos_items[idx]
+        neg_item = self.neg_items[idx]
+
+        sample = {'user':user, 'pos_item':pos_item, 'neg_item':neg_item}
+
+        return sample  
+
+def NDCG_binary_at_k_batch(X_pred, heldout_batch, k=100):
+    '''
+    normalized discounted cumulative gain@k for binary relevance
+    ASSUMPTIONS: all the 0's in heldout_data indicate 0 relevance
+    '''
+    batch_users = X_pred.shape[0]
+    idx_topk_part = bn.argpartition(-X_pred, k, axis=1)
+    topk_part = X_pred[np.arange(batch_users)[:, np.newaxis],
+                       idx_topk_part[:, :k]]
+    idx_part = np.argsort(-topk_part, axis=1)
+    # X_pred[np.arange(batch_users)[:, np.newaxis], idx_topk] is the sorted
+    # topk predicted score
+    idx_topk = idx_topk_part[np.arange(batch_users)[:, np.newaxis], idx_part]
+    # build the discount template
+    tp = 1. / np.log2(np.arange(2, k + 2))
+
+    DCG = (heldout_batch[np.arange(batch_users)[:, np.newaxis],
+                         idx_topk].toarray() * tp).sum(axis=1)
+    IDCG = np.array([(tp[:min(n, k)]).sum()
+                     for n in heldout_batch.getnnz(axis=1)])
+    return DCG / IDCG
+
+def Recall_at_k_batch(X_pred, heldout_batch, k=100):
+    batch_users = X_pred.shape[0]
+
+    idx = bn.argpartition(-X_pred, k, axis=1)
+    X_pred_binary = np.zeros_like(X_pred, dtype=bool)
+    X_pred_binary[np.arange(batch_users)[:, np.newaxis], idx[:, :k]] = True
+
+    X_true_binary = (heldout_batch > 0).toarray()
+    tmp = (np.logical_and(X_true_binary, X_pred_binary).sum(axis=1)).astype(
+        np.float32)
+    recall = tmp / np.minimum(k, X_true_binary.sum(axis=1))
+    return recall
 
 
-from utils import *
 
 
-# In[4]:
+
+
+
+
 
 
 def load_train_data(csv_file):
@@ -68,31 +161,18 @@ def load_tr_te_data(csv_file_tr, csv_file_te):
     data_te = sparse.csr_matrix((np.ones_like(rows_te),
                              (rows_te, cols_te)), dtype='float64', shape=(end_idx - start_idx + 1, n_items))
     
-#     train_df = pd.DataFrame()
-#     train_df['user'] = np.asarray(rows_tr)
-#     train_df['item'] = np.asarray(cols_tr)
     
     return data_tr, data_te
 
 
-# In[5]:
 
+#%%%%%%-----------------Load Data-----------------
 
 # change to the location of the data
-DATA_DIR = '/users/kent/dli12/data/netflix/'
-
-#itemId='movieId'   # for ml-20m data
+DATA_DIR = 'path'
 
 pro_dir = os.path.join(DATA_DIR, 'pro_sg')
 
-
-# In[6]:
-
-
-pro_dir = os.path.join(DATA_DIR, 'pro_sg')
-
-
-# In[7]:
 
 
 unique_sid = list()
@@ -103,50 +183,9 @@ with open(os.path.join(pro_dir, 'unique_sid.txt'), 'r') as f:
 n_items = len(unique_sid)
 
 
-# In[8]:
-
-
 # load training data
-train_data, _ = load_train_data(os.path.join(pro_dir, 'train.csv'))
+train_data, train_df = load_train_data(os.path.join(pro_dir, 'train.csv'))
 
-
-# In[9]:
-
-
-t_user = train_data.shape[0]
-
-
-
-uorder = np.arange(t_user)
-np.random.seed(1008)
-np.random.shuffle(uorder)
-
-
-# In[12]:
-
-
-keepu = 70000
-keeprows = uorder[:keepu]
-
-
-# In[13]:
-
-
-sub_train = train_data[keeprows]
-
-
-# In[14]:
-
-
-subu = sub_train.tocoo().row
-subi = sub_train.tocoo().col
-
-train_df = pd.DataFrame()
-train_df['user'] = subu
-train_df['item'] = subi
-
-
-# In[15]:
 
 
 test_data_tr, test_data_te = load_tr_te_data(
@@ -158,18 +197,15 @@ vali_data_tr, vali_data_te = load_tr_te_data(
     os.path.join(pro_dir, 'validation_te.csv'))
 
 
-# In[16]:
+
 
 
 data_reader = DataReader(train_df, n_items)
 
 
-# In[17]:
 
-
+# Load SVD
 z = np.load(DATA_DIR + 'svd.npz')
-
-
 
 
 s = z['s']
@@ -179,7 +215,7 @@ u = z['u']
 
 
 
-class PCA(nn.Module):
+class LRR(nn.Module):
     
     def __init__(self, num_item, UI, k, u, s, vh, lamd0 = 8000., C = 1000., p = 0.5):
         
@@ -189,7 +225,7 @@ class PCA(nn.Module):
         self.num_item = num_item
         
         self.lamd = nn.Embedding(k, 1)
-        #self.D = nn.Embedding(num_item, 1)
+        self.D = nn.Embedding(num_item, 1)
         self.Db = nn.Embedding(1, num_item)
         
  
@@ -206,7 +242,7 @@ class PCA(nn.Module):
     def _init_weight(self):
 
         nn.init.zeros_(self.lamd.weight)
-        #nn.init.zeros_(self.D.weight)
+        nn.init.zeros_(self.D.weight)
         nn.init.zeros_(self.Db.weight)
         
     def getW(self):
@@ -216,33 +252,13 @@ class PCA(nn.Module):
         W = torch.matmul(self.u, torch.diag(ss))
         W = torch.matmul(W, self.vh)
         
-        #W = torch.sigmoid(self.D.weight) * W
+        W = torch.sigmoid(self.D.weight) * W
         W = W * torch.sigmoid(self.Db.weight)
+
         W[torch.arange(self.num_item), torch.arange(self.num_item)] = 0
-        #W[torch.arange(self.num_item), torch.arange(self.num_item)] = 0
-        #W = W - torch.diag(torch.diag(W))
-        
+       
         return W    
-    
-    def bpr_loss(self, user, pos_item, neg_item, decay = 1e-3):
         
-        W = self.getW()
-        c = torch.arange(user.shape[0])
-        
-        #A = torch.tensor(self.UI[user].toarray()).float().to(device)
-        A = self.UI[user]
-        A[c, pos_item] = 0
-        A = self.drop(A)
-        
-        AW = torch.matmul(A, W)
-        
-        pos = AW[c, pos_item]
-        neg = AW[c, neg_item]
-        
-        loss = - torch.log(torch.sigmoid(100*(pos - neg))).mean()
-        
-        return loss 
-    
     def bpr_loss2(self, user, pos_item, neg_item):
         
         #A = torch.tensor(self.UI[user].toarray()).float().to(device)
@@ -261,18 +277,15 @@ class PCA(nn.Module):
         
         A = self.drop(A)
 
-        #AW = torch.matmul(A, W)
         pos = (A * posW).sum(1)
         neg = (A * negW).sum(1)
-        #pos = AW[c, pos_item]
-        #neg = AW[c, neg_item]
 
         loss = - torch.log(torch.sigmoid(100*(pos - neg))).mean()
 
         return loss
 
 
-# In[20]:
+
 
 
 def evaluate(f, BB, test_data_tr = test_data_tr, test_data_te = test_data_te):
@@ -317,7 +330,6 @@ def evaluate(f, BB, test_data_tr = test_data_tr, test_data_te = test_data_te):
     return r50
 
 
-# In[21]:
 
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else "cpu")
@@ -325,47 +337,35 @@ np.random.seed(0)
 torch.manual_seed(101)
 
 
-# In[22]:
-
-
 k = 2000
 lr = 0.001
-epochs = 5
+epochs = 10
 train_batch_size = 2048
-N = 1 # negative sampling
+N = 8 # negative sampling
 
 p = 0.5 # dropout rate
 C = 5000. # for netflix
 lamd0 = 40000. # for netflix
 
 
-# In[23]:
+#If you dont have enough memory, try to pass user-item row to GPU when necessary 
+UI = torch.tensor(train_data.toarray()).float().to(device)
 
 
-UI = torch.tensor(sub_train.toarray()).float().to(device)
-
-
-# In[24]:
-
-
-#UI = torch.tensor(np.asarray(train_data.todense(), dtype = np.float32)).float().to(device)
-#UI = train_data
 tu = torch.tensor(u[:,:k]).float().to(device)
 ts = torch.tensor(s[:k]).float().to(device)
 tvh = torch.tensor(vh[:k,:]).float().to(device)
 
 
-# In[25]:
 
 
-model = PCA(n_items, UI, k, tu, ts, tvh, lamd0 = lamd0, C = C, p =p).to(device)
+model = LRR(n_items, UI, k, tu, ts, tvh, lamd0 = lamd0, C = C, p =p).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr = lr)
 
 
-# In[26]:
 
 
-fname = "[used]NETFLIX_PCA_2000_LT_RMD_SUBSET"
+fname = "NETFLIX_LRR_Lambda_HT_RMD"
 f = open("save/" + fname + ".txt", "a")
 print('initialization:')
 f.write('initialization:')
@@ -408,10 +408,8 @@ for epoch in range(epochs):
             
         loss.backward()
         optimizer.step()
-        
-
-        
-        if (idx+1)%2000 == 0:
+           
+        if (idx+1)%5000 == 0:
             
             f = open("save/"+fname + ".txt", "a")
             model.eval()
